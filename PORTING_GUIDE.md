@@ -1,39 +1,101 @@
-# Kanban Porting Guide for Chatwoot
+# Guia Definitivo de Migração: Kanban para Chatwoot (VPS)
 
-This guide explains how to port the Kanban feature from the StackLab version to your original Chatwoot installation on a VPS.
+Este guia explica como ativar o Kanban na sua VPS migrando para a imagem Docker da StackLab. Como a sua VPS já está rodando e contém dados de clientes, siga estes passos com a **máxima cautela**. O Kanban **não é um plugin solto**; sua interface visual está compilada irreversivelmente dentro desta imagem Docker específica.
 
-## Prerequisites
-- Access to your VPS terminal or Portainer.
-- Ability to run commands inside the Chatwoot container.
+## ⚠️ Avisos Críticos Iniciais
+1. **BACKUP DO BANCO DE DADOS**: Faça um dump completo do banco de dados do seu Chatwoot antes de começar. As migrações da StackLab alterarão sua estrutura e isso é um caminho sem volta (sem backup).
+2. **Versão do Chatwoot**: Esta imagem (`stacklabdigital/kanban:v2.9`) atualizará seu núcleo do Chatwoot para a **v4.10.1**.
 
-## Step 1: Upload Backend Files
-Copy the contents of the `app/`, `db/migrate/`, `app/policies/`, `app/services/`, and `app/jobs/` directories from this package to your Chatwoot installation.
+---
 
-If you are using Docker, you can use `docker cp`:
+## Passo 1: Preparar o Banco de Dados (PostgreSQL)
+
+A imagem da StackLab exige a extensão `vector` no PostgreSQL. Se ela não estiver presente, o contêiner do Rails ficará num ciclo infinito de reinicializações e derrubará o atendimento dos seus clientes.
+
+Acesse o servidor do banco de dados na sua VPS e execute:
 ```bash
-# Example for one file
-docker cp app/models/kanban_item.rb chatwoot_web_1:/app/app/models/
-```
-*Tip: It's easier to copy the whole directories if you have volume mapping.*
-
-## Step 2: Apply Database Migrations
-Run the migrations inside your Rails container:
-```bash
-docker exec -it chatwoot_web_1 bundle exec rails db:migrate
+# Entre no container do PostgreSQL (ajuste o nome do container conforme sua instalação, ex: chatwoot-postgres-1)
+docker exec -it <NOME_DO_CONTAINER_POSTGRES> psql -U postgres -d chatwoot_production -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
 
-## Step 3: Patch Configuration
-Apply the changes described in `PORTING_PATCHES.md` to:
-1. `config/routes.rb`: Add the Kanban routes.
-2. `config/features.yml`: Add the `kanban_board` feature flag.
-3. `app/models/account.rb`: Add the associations.
+---
 
-## Step 4: Frontend (Compiled Assets)
-Since the source code for the frontend is not available, you would need to inject the compiled assets.
-**Warning:** This part is complex. If your original Chatwoot uses a different version of Node/Vite, the compiled assets might not work directly without manual injection into the main layout.
+## Passo 2: Atualizar a Imagem no `docker-compose.yaml`
 
-## Step 5: Restart Services
-Restart your Chatwoot containers to apply the changes.
-```bash
-docker restart chatwoot_web_1 chatwoot_worker_1
+No diretório do Chatwoot na sua VPS, abra o `docker-compose.yaml`.
+
+Substitua a imagem oficial em todos os serviços do Chatwoot (normalmente nos blocos `rails`, `sidekiq` e `worker`):
+**De:**
+```yaml
+    image: chatwoot/chatwoot:latest
 ```
+**Para:**
+```yaml
+    image: stacklabdigital/kanban:v2.9
+```
+
+---
+
+## Passo 3: Criar o Patch de Combate ao Bug 500
+
+A imagem da StackLab possui um bug silencioso no login (chama um método inativo `enable_feature!`) que gera um Erro 500, impossibilitando a entrada dos usuários. Para consertá-lo, crie um arquivo chamado `00_account_patches.rb` na pasta principal do Chatwoot da sua VPS com este código exato:
+
+```ruby
+# 00_account_patches.rb
+Rails.application.config.to_prepare do
+  Account.class_eval do
+    unless method_defined?(:enable_feature!)
+      def enable_feature!(feature_name)
+        setter_method = "#{feature_name}_enabled="
+        send(setter_method, true) if respond_to?(setter_method)
+        save(validate: false)
+      end
+    end
+    unless method_defined?(:enable_feature)
+      def enable_feature(feature_name)
+        enable_feature!(feature_name)
+      end
+    end
+  end
+end
+```
+
+---
+
+## Passo 4: Subir a Nova Imagem e Executar as Migrações
+
+Inicie o processo de boot para baixar a imagem v2.9. Ao inicializar, execute as migrações:
+```bash
+docker compose up -d
+docker compose run --rm rails bundle exec rake db:migrate
+```
+
+---
+
+## Passo 5: Injetar o Patch e Reiniciar
+
+Com os contêineres rodando, injecte o patch de login que criamos no Passo 3 dentro dos serviços vitais e reinicie:
+```bash
+# Ajuste os nomes dos containers se necessário
+docker cp 00_account_patches.rb chatwoot-rails-1:/app/config/initializers/00_account_patches.rb
+docker cp 00_account_patches.rb chatwoot-sidekiq-1:/app/config/initializers/00_account_patches.rb
+docker compose restart rails sidekiq worker
+```
+
+---
+
+## Passo 6: Ativar o Kanban na Interface (Feature Flag)
+
+Para que o botão "Kanban" ou "Funis" apareça na barra lateral esquerda, a conta do Chatwoot na VPS precisa conter a *Feature Flag* interna `kanban_board` ativada.
+
+Rode o seguinte comando no terminal da sua VPS:
+```bash
+docker compose run --rm rails bundle exec rails runner "Account.all.each { |a| a.enable_features!('kanban_board') }"
+```
+
+> **Nota SuperAdmin:** Somente administradores da conta poderão ver o menu no frontend. O SuperAdmin consegue liberar e desabilitar nativamente ativando/desativando "kanban_board" em `enabled_features` do respectivo `Account`.
+
+---
+
+## Verificação Final
+Acesse a aba do seu Chatwoot de produção. O painel logará normalmente e o botão do **Kanban** estará disponível na barra lateral principal (agora já visível na versão PC ou acessível no `/app/accounts/x/kanban`).
